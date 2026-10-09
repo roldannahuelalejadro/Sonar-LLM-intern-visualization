@@ -1,0 +1,32 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+build/
+dist/
+captures/
+artifacts/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+.secrets/
+*.pem
+*.key
+.vscode/
+.idea/
+
+# Generated vectors, captures and logs
+*.npy
+*.npz
+*.log
+Thumbs.db
+.DS_Store
+

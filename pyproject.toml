@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sonar-activaciones"
+version = "0.2.0"
+description = "Local, model-independent activation vector monitor"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = ["numpy==2.3.3"]
+
+[project.optional-dependencies]
+gui = ["PySide6==6.11.2", "pyqtgraph==0.14.0"]
+torch = ["torch>=2.6"]
+dev = ["pytest==8.4.2"]
+
+[project.scripts]
+sonar-activaciones = "sonar_activaciones.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
