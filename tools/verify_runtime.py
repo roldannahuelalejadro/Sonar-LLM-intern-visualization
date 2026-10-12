@@ -11,6 +11,7 @@ import numpy as np
 from sonar_activaciones import MonitorConfig, Observation, ProbeDescriptor
 from sonar_activaciones.session import MonitorSession
 from sonar_activaciones.processing.history import History
+from evidence import identity
 
 
 def viewer(probes, config, channel):
@@ -21,7 +22,13 @@ def viewer(probes, config, channel):
     window = MonitorWindow(probes, config, channel)
     window.show()
     channel.ready.set()
-    QtCore.QTimer.singleShot(2500, window.close)
+    def finish():
+        metrics = {'processing_ms_mean': window.state.processing_ns/max(1, window.state.received_count)/1e6,
+                   'projection_ms_mean_per_received': window.state.projection_ns/max(1, window.state.received_count)/1e6}
+        target = Path(os.environ.get('SONAR_RUNTIME_OUTPUT', 'artifacts/runtime-verification-v021.json'))
+        target.with_suffix('.processing.json').write_text(json.dumps(metrics), encoding='utf-8')
+        window.close()
+    QtCore.QTimer.singleShot(2500, finish)
     app.exec()
 
 
@@ -44,7 +51,10 @@ def run():
     assert session.status()["state"] == "disconnected", "Native window did not close"
     assert session.publish("load", values) == "disconnected"
     counters = session.status()
+    session._process.join(3)
+    child_exitcode = session._process.exitcode
     session.close()
+    assert child_exitcode == 0, f'Viewer exit code: {child_exitcode}'
     assert session._channel.buffer is None
     assert {p.pid for p in mp.active_children()} == before
     history = History(1024**2)
@@ -59,6 +69,8 @@ def run():
     def avg(total, count):
         return counters[total]/max(1, counters[count])/1e6
     report = {
+        'revision': identity(),
+        'viewer_exitcode': child_exitcode,
         "platform": platform.platform(), "python": platform.python_version(), "dimension": 4096,
         "queue_capacity": 16, "render_hz": 10, "synthetic": True,
         "publish_ms_median": statistics.median(durations), "publish_ms_p95": float(np.percentile(durations, 95)),
@@ -73,7 +85,9 @@ def run():
         "note": "One local synthetic run, not performance guarantees; painting is CPU Qt paintEvent, not physical display latency."
     }
     Path("artifacts").mkdir(exist_ok=True)
-    Path("artifacts/runtime-verification-v02.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    target = Path(os.environ.get('SONAR_RUNTIME_OUTPUT', 'artifacts/runtime-verification-v021.json'))
+    report.update(json.loads(target.with_suffix('.processing.json').read_text()))
+    target.write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(json.dumps(report, indent=2))
 
 

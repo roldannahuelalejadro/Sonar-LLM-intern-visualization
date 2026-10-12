@@ -3,13 +3,14 @@ import argparse
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="SONAR: monitor local de activaciones CPU")
-    parser.add_argument("--version", action="version", version="SONAR 0.2.0")
+    from . import __version__
+    parser.add_argument("--version", action="version", version=f"SONAR {__version__}")
     parser.add_argument("--history-mib", type=int, default=None, help="Cuota reciente legada; el total sera mayor")
     parser.add_argument("--budget-mib", type=int, default=64, help="Presupuesto global de datos administrados")
     parser.add_argument("--work-mib", type=int, default=8)
     parser.add_argument("--recent-percent", type=int, default=70)
     parser.add_argument("--retention", choices=['combined', 'detail'], default='combined')
-    parser.add_argument("--render-hz", type=float, default=5)
+    parser.add_argument("--render-hz", type=float, default=30)
     commands = parser.add_subparsers(dest="command")
     commands.add_parser("demo", help="Abrir fuente sintetica rotulada")
     replay = commands.add_parser("replay", help="Reproducir captura JSON + NPZ")

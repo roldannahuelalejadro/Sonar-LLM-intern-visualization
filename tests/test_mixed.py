@@ -41,7 +41,8 @@ def test_mixed_roundtrip_and_missing_vector(tmp_path):
 
 
 def test_v1_load_and_rejected_file_leave_budget_intact(tmp_path):
-    old = save_capture(tmp_path/'old.json', Capture((probe(),), tuple(sample(i) for i in range(10)), snapshot=sample(3)))
+    samples = tuple(sample(i) for i in range(10))
+    old = save_capture(tmp_path/'old.json', Capture((probe(),), samples, snapshot=samples[3]))
     budget = WorkAdmission(8*1024**2)
     state, _, _ = load_state(old, MonitorConfig(), budget)
     assert state.current().sequence == 3

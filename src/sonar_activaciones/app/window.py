@@ -11,12 +11,15 @@ from ..contracts import Observation, MIB
 from ..processing.memory import rss_bytes, pca_known_peak, header_cost
 from ..storage.mixed import save_state, load_state
 from ..processing.reference import magnitude
+from ..processing.display import MODE_NAMES, unavailable_reason, projected_values
 from .state import ViewerState
 from .views.matrix import MatrixView
 from .views.history import HistoryView
 from ..processing.temporal import coordinates
 from ..processing.projection import component_basis, fit_pca, load_basis, save_basis, MAX_PCA_BYTES
 from .views.directions import DirectionsView
+from .views.timing import NoticeLabel
+from .themes import THEMES, saved_theme, apply_window, standard_icon
 from ..storage.capture import Capture, save_capture, load_capture
 
 
@@ -44,6 +47,13 @@ class ScientificSpinBox(QtWidgets.QDoubleSpinBox):
             return (state.Intermediate if all(c in "0123456789eE+-,." for c in text) else state.Invalid, text, position)
 
 
+class ComponentRangeSpinBox(QtWidgets.QSpinBox):
+    dimension = 256
+
+    def textFromValue(self, value):
+        return f"{value*256}..{min(self.dimension-1, value*256+255)}"
+
+
 class MonitorWindow(QtWidgets.QMainWindow):
     def __init__(self, probes, config, channel=None):
         super().__init__()
@@ -58,6 +68,11 @@ class MonitorWindow(QtWidgets.QMainWindow):
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="SONAR-PCA")
         self.pca_future = None
         self.pca_probe = None
+        self.pca_state = None
+        self.source_closed = False
+        self._tick_signature = None
+        self._last_render_at = 0.
+        self._rendered_probe = None
         self.replay = None
         self.replay_index = -1
         self.replay_positions = {}
@@ -68,31 +83,33 @@ class MonitorWindow(QtWidgets.QMainWindow):
         self.setMinimumSize(860, 600)
         self._build()
         self._unify()
+        apply_window(self, saved_theme(), persist=False)
+        for button in self.findChildren(QtWidgets.QToolButton):
+            button.setAccessibleName(button.toolTip() or button.text())
         self.timer = QtCore.QTimer(self)
+        self.timer.setTimerType(QtCore.Qt.TimerType.PreciseTimer)
         self.timer.timeout.connect(self.tick)
         self.timer.start(round(1000 / config.render_hz))
         self.receive_timer = QtCore.QTimer(self)
+        self.receive_timer.setTimerType(QtCore.Qt.TimerType.PreciseTimer)
         self.receive_timer.timeout.connect(self.receive)
         self.receive_timer.start(10)
         self.render()
 
+    def change_theme(self):
+        apply_window(self, self.theme_combo.currentData())
+
+    def standard_icon(self, symbol):
+        return standard_icon(self, symbol)
+
     def tool(self, name, icon, callback, checkable=False):
-        action = QtGui.QAction(self.style().standardIcon(icon), name, self)
+        action = QtGui.QAction(self.standard_icon(icon), name, self)
         action.setToolTip(name)
         action.setCheckable(checkable)
         action.triggered.connect(callback)
         return action
 
     def _build(self):
-        self.setStyleSheet("""
-            QMainWindow, QWidget { background: #f5f7f8; color: #222d34; font-size: 13px; }
-            QToolBar { spacing: 7px; padding: 6px; border-bottom: 1px solid #cdd4d9; }
-            QComboBox, QSpinBox, QDoubleSpinBox { background: white; padding: 4px; min-height: 21px; }
-            QTabWidget::pane { border: 1px solid #cdd4d9; }
-            QTabBar::tab { padding: 9px 18px; background: #e5e9eb; }
-            QTabBar::tab:selected { background: white; border-top: 2px solid #19766d; }
-            QStatusBar { border-top: 1px solid #cdd4d9; }
-        """)
         top = self.addToolBar("Controles")
         top.setMovable(False)
         top.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
@@ -107,28 +124,47 @@ class MonitorWindow(QtWidgets.QMainWindow):
         top.addWidget(self.probe_combo)
         self.source_badge = label("DEMO SINTETICA" if self.synthetic else "SIN FUENTE" if not self.state.probes else "CONECTADO")
         self.source_badge.setStyleSheet("color: #815619; padding: 8px; font-weight: 600;")
+        self.source_badge.setMaximumWidth(300)
         top.addWidget(self.source_badge)
-        top.addSeparator()
+        self.refresh_spin = QtWidgets.QDoubleSpinBox()
+        self.refresh_spin.setRange(.5, 60)
+        self.refresh_spin.setDecimals(1)
+        self.refresh_spin.setValue(self.config.render_hz)
+        self.refresh_spin.setPrefix('Vista ')
+        self.refresh_spin.setSuffix(' Hz')
+        self.refresh_spin.setMaximumWidth(125)
+        self.refresh_spin.setToolTip('Frecuencia solicitada de dibujo; no cambia la captura ni inventa muestras')
+        self.refresh_spin.valueChanged.connect(self.set_render_rate)
+        top.addWidget(self.refresh_spin)
+        self.theme_combo = QtWidgets.QComboBox()
+        for key, theme in THEMES.items():
+            self.theme_combo.addItem(theme.name, key)
+        self.theme_combo.setFixedWidth(120)
+        self.theme_combo.setAccessibleName('Tema de interfaz')
+        self.theme_combo.setToolTip('Tema de interfaz: claro u oscuro; conserva los colores de los datos')
+        self.theme_combo.currentIndexChanged.connect(self.change_theme)
+        top.addWidget(self.theme_combo)
+        self.addToolBarBreak()
+        actions = self.addToolBar('Acciones')
+        actions.setMovable(False)
+        actions.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         sp = QtWidgets.QStyle.StandardPixmap
-        self.freeze_action = self.tool("Congelar", sp.SP_MediaPause, self.toggle_freeze, True)
-        self.live_action = self.tool("Vivo", sp.SP_MediaPlay, self.go_live)
-        self.ref_action = self.tool("Referencia", sp.SP_DialogApplyButton, self.set_reference)
+        self.freeze_action = self.tool("Pausar vista", sp.SP_MediaPause, self.toggle_freeze, True)
+        self.live_action = self.tool("Volver al presente", sp.SP_MediaPlay, self.go_live)
+        self.ref_action = self.tool("Fijar referencia", sp.SP_DialogApplyButton, self.set_reference)
         for action in (self.freeze_action, self.live_action, self.ref_action):
-            top.addAction(action)
-        top.addSeparator()
+            actions.addAction(action)
+        actions.addSeparator()
         self.save_action = self.tool("Guardar captura", sp.SP_DialogSaveButton, self.save_current_capture)
         self.open_action = self.tool("Abrir captura", sp.SP_DialogOpenButton, self.choose_capture)
         for action in (self.save_action, self.open_action):
-            button = QtWidgets.QToolButton()
-            button.setDefaultAction(action)
-            button.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonIconOnly)
-            top.addWidget(button)
+            actions.addAction(action)
         root = QtWidgets.QWidget()
         self.setCentralWidget(root)
         vertical = QtWidgets.QVBoxLayout(root)
         controls = QtWidgets.QHBoxLayout()
         self.mode_combo = QtWidgets.QComboBox()
-        for text, value in (("Original", "raw"), ("Delta a referencia", "reference_delta"), ("Delta consecutivo", "previous_delta")):
+        for value, text in MODE_NAMES.items():
             self.mode_combo.addItem(text, value)
         self.mode_combo.currentIndexChanged.connect(self.change_mode)
         controls.addWidget(self.mode_combo)
@@ -140,13 +176,18 @@ class MonitorWindow(QtWidgets.QMainWindow):
         self.scale_spin.setMaximumWidth(125)
         self.scale_spin.valueChanged.connect(self.change_scale)
         controls.addWidget(self.scale_spin)
-        controls.addWidget(label("Bloque"))
-        self.page_spin = QtWidgets.QSpinBox()
+        self.auto_scale = QtWidgets.QToolButton()
+        self.auto_scale.setIcon(self.style().standardIcon(sp.SP_DesktopIcon))
+        self.auto_scale.setToolTip('Ajustar escala a seleccion')
+        self.auto_scale.clicked.connect(self.fit_scale)
+        controls.addWidget(self.auto_scale)
+        controls.addWidget(label("Rango de componentes"))
+        self.page_spin = ComponentRangeSpinBox()
+        self.page_spin.setToolTip('Indices del vector; no es una capa del modelo')
         self.page_spin.valueChanged.connect(self.render)
         controls.addWidget(self.page_spin)
         controls.addStretch()
         self.frame_label = label()
-        controls.addWidget(self.frame_label)
         vertical.addLayout(controls)
         split = QtWidgets.QSplitter()
         vertical.addWidget(split, 1)
@@ -168,7 +209,8 @@ class MonitorWindow(QtWidgets.QMainWindow):
         self.window_spin.setValue(128)
         self.window_spin.valueChanged.connect(self.render)
         h_controls.addWidget(self.window_spin)
-        h_controls.addWidget(label("Trazas"))
+        self.traces_label = label("Componentes")
+        h_controls.addWidget(self.traces_label)
         self.trace_spins = []
         for index in range(3):
             spin = QtWidgets.QSpinBox()
@@ -180,6 +222,8 @@ class MonitorWindow(QtWidgets.QMainWindow):
         h_layout.addLayout(h_controls)
         self.history_view = HistoryView()
         h_layout.addWidget(self.history_view, 1)
+        self.history_notice = NoticeLabel()
+        h_layout.addWidget(self.history_notice)
         self.tabs.addTab(self.history_page, "Historia y trazas")
         self.directions_page = QtWidgets.QWidget()
         d_layout = QtWidgets.QVBoxLayout(self.directions_page)
@@ -206,10 +250,11 @@ class MonitorWindow(QtWidgets.QMainWindow):
         d_controls.addStretch()
         d_layout.addLayout(d_controls)
         pca_controls = QtWidgets.QHBoxLayout()
-        pca_controls.addWidget(label("PCA: ultimas lecturas hasta cuadro"))
+        pca_controls.addWidget(label("Ventana PCA"))
         self.pca_count = QtWidgets.QSpinBox()
         self.pca_count.setRange(3, 512)
         self.pca_count.setValue(64)
+        self.pca_count.setSuffix(' capturas')
         pca_controls.addWidget(self.pca_count)
         self.pca_button = QtWidgets.QPushButton("Calcular y fijar PCA (2D)")
         self.pca_button.setIcon(self.style().standardIcon(sp.SP_BrowserReload))
@@ -275,12 +320,12 @@ class MonitorWindow(QtWidgets.QMainWindow):
         for name, icon, callback in (("Anterior", sp.SP_MediaSkipBackward, lambda: self.step_replay(-1)),
                                       ("Siguiente", sp.SP_MediaSkipForward, lambda: self.step_replay(1))):
             button = QtWidgets.QToolButton()
-            button.setIcon(self.style().standardIcon(icon))
+            button.setIcon(self.standard_icon(icon))
             button.setToolTip(name)
             button.clicked.connect(callback)
             replay_layout.addWidget(button)
         self.replay_play = QtWidgets.QToolButton()
-        self.replay_play.setIcon(self.style().standardIcon(sp.SP_MediaPlay))
+        self.replay_play.setIcon(self.standard_icon(sp.SP_MediaPlay))
         self.replay_play.setToolTip("Reproducir / pausar captura")
         self.replay_play.setCheckable(True)
         self.replay_play.toggled.connect(self.toggle_replay)
@@ -313,23 +358,35 @@ class MonitorWindow(QtWidgets.QMainWindow):
         self.inspector_dock.hide()
         toolbar = self.findChildren(QtWidgets.QToolBar)[0]
         toolbar.addAction(self.inspector_dock.toggleViewAction())
-        # Native-style tool buttons avoid a toolbar that overflows at 900 px.
-        toolbar.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonIconOnly)
         self.probe_combo.setMinimumWidth(120)
         self.probe_combo.setMaximumWidth(230)
         self.panels = []
+        self.panel_titles = []
         self.tabs.blockSignals(True)
-        for title, widget in (("Matriz", self.matrix), ("Mapa representacional", self.directions_page),
+        self.matrix_page = QtWidgets.QWidget()
+        matrix_layout = QtWidgets.QVBoxLayout(self.matrix_page)
+        matrix_layout.setContentsMargins(0, 0, 0, 0)
+        self.matrix_notice = NoticeLabel()
+        matrix_layout.addWidget(self.matrix_notice)
+        self.matrix.setParent(self.matrix_page)
+        matrix_layout.addWidget(self.matrix, 1)
+        self.matrix.show()
+        self.trace_selected_button = QtWidgets.QPushButton('Usar componente seleccionada en trazas')
+        self.trace_selected_button.clicked.connect(self.trace_inspected)
+        matrix_layout.addWidget(self.trace_selected_button)
+        for title, widget in (("Matriz", self.matrix_page), ("Mapa representacional", self.directions_page),
                               ("Historial de capturas", self.history_page)):
             widget.setParent(None)
             panel = QtWidgets.QWidget()
             layout = QtWidgets.QVBoxLayout(panel)
             layout.setContentsMargins(0, 0, 0, 0)
             bar = QtWidgets.QHBoxLayout()
-            bar.addWidget(label(title))
+            title_label = label(title)
+            self.panel_titles.append(title_label)
+            bar.addWidget(title_label)
             bar.addStretch()
             button = QtWidgets.QToolButton()
-            button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_TitleBarMaxButton))
+            button.setIcon(self.standard_icon(QtWidgets.QStyle.StandardPixmap.SP_TitleBarMaxButton))
             button.setToolTip("Maximizar / restaurar panel")
             button.clicked.connect(lambda checked=False, n=len(self.panels): self.maximize_panel(n))
             bar.addWidget(button)
@@ -401,13 +458,7 @@ class MonitorWindow(QtWidgets.QMainWindow):
         for signal in (self.budget_spin.valueChanged, self.work_spin.valueChanged, self.fraction_slider.valueChanged,
                        self.retention_combo.currentIndexChanged, self.weights_edit.textChanged):
             signal.connect(self.preview_memory)
-        # Compact map controls and advanced PCA dimension.
-        for button in self.directions_page.findChildren(QtWidgets.QPushButton):
-            button.setToolTip(button.text())
-            if button is not self.pca_button:
-                button.setText("")
-                button.setMaximumWidth(32)
-        self.pca_button.setText("Fijar PCA")
+        self.pca_button.setText("Crear mapa PCA")
         self.pca_button.setToolTip("PCA fija sobre ventana retenida; workspace LAPACK externo al presupuesto")
         self.pca_axes = QtWidgets.QSpinBox()
         self.pca_axes.setRange(1, 32)
@@ -422,13 +473,12 @@ class MonitorWindow(QtWidgets.QMainWindow):
         segment_row.addWidget(self.segment_combo, 1)
         self.map_axes = []
         for index in (0, 1):
-            spin = QtWidgets.QSpinBox()
-            spin.setRange(0, 31)
-            spin.setValue(index)
-            spin.setMaximumWidth(55)
-            spin.valueChanged.connect(self.render)
-            segment_row.addWidget(spin)
-            self.map_axes.append(spin)
+            combo = QtWidgets.QComboBox()
+            combo.setMinimumContentsLength(4)
+            combo.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            combo.setToolTip('Horizontal' if index == 0 else 'Vertical')
+            combo.currentIndexChanged.connect(self.render)
+            self.map_axes.append(combo)
         retire = QtWidgets.QToolButton()
         retire.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_TrashIcon))
         retire.setToolTip("Retirar segmento seleccionado y sus coordenadas")
@@ -445,21 +495,98 @@ class MonitorWindow(QtWidgets.QMainWindow):
         self.pca_estimate = label(wrap=True)
         settings_layout.addWidget(self.pca_estimate)
         settings_button = QtWidgets.QToolButton()
-        settings_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogDetailedView))
+        settings_button.setIcon(self.standard_icon(QtWidgets.QStyle.StandardPixmap.SP_FileDialogDetailedView))
         settings_button.setToolTip('Bases, componentes y PCA')
         settings_button.setCheckable(True)
         settings_button.toggled.connect(self.map_settings.setVisible)
         segment_row.addWidget(settings_button)
+        # Keep the base selector available in advanced settings, without taking
+        # an entire row away from the plane in the combined view.
+        settings_layout.insertWidget(0, self.segment_combo)
+        settings_layout.insertWidget(1, retire)
+        axes_row = QtWidgets.QHBoxLayout()
+        for name, combo in zip(('Horizontal', 'Vertical'), self.map_axes):
+            axes_row.addWidget(label(name))
+            axes_row.addWidget(combo, 1)
+        self.directions_page.layout().insertLayout(1, axes_row)
+        actions_row = QtWidgets.QHBoxLayout()
+        actions_row.addWidget(self.pca_button)
+        self.import_basis_button.setText('Cargar base')
+        actions_row.addWidget(self.import_basis_button)
+        actions_row.addWidget(settings_button)
+        actions_row.addStretch()
+        self.directions_page.layout().insertLayout(0, actions_row)
+        settings_layout.addWidget(label('Componentes directas: coordenadas originales, no resumen del vector completo.', wrap=True))
+        self.pca_dialog = QtWidgets.QDialog(self)
+        self.pca_dialog.setWindowTitle('Preparar base PCA')
+        self.pca_dialog.resize(470, 230)
+        pca_layout = QtWidgets.QVBoxLayout(self.pca_dialog)
+        pca_row = QtWidgets.QHBoxLayout()
+        pca_row.addWidget(label('Ventana PCA'))
+        pca_row.addWidget(self.pca_count)
+        pca_row.addWidget(label('Ejes'))
+        pca_row.addWidget(self.pca_axes)
+        pca_layout.addLayout(pca_row)
+        pca_layout.addWidget(self.pca_estimate)
+        self.pca_start_button = QtWidgets.QPushButton('Calcular base fija')
+        self.pca_start_button.clicked.connect(self.start_pca)
+        pca_layout.addWidget(self.pca_start_button)
+        self.pca_button.clicked.disconnect(self.start_pca)
+        self.pca_button.clicked.connect(self.prepare_pca)
+        self.pca_count.valueChanged.connect(self.render_directions)
+        self.pca_axes.valueChanged.connect(self.render_directions)
+        self.evolution_combo = QtWidgets.QComboBox()
+        for name, key in (('Cambio entre capturas', 'change'), ('Trazas de componentes', 'traces'), ('Mapa de calor', 'heat')):
+            self.evolution_combo.addItem(name, key)
+        self.change_space = QtWidgets.QComboBox()
+        self.change_space.addItem('Espacio completo', 'full')
+        self.change_space.addItem('Espacio proyectado', 'projected')
+        for combo in (self.evolution_combo, self.change_space):
+            combo.currentIndexChanged.connect(self.render)
+        history_controls = self.history_page.layout().itemAt(0).layout()
+        history_controls.insertWidget(0, self.change_space)
+        history_controls.insertWidget(0, self.evolution_combo)
+        self.evolution_combo.setMaximumWidth(185)
+        self.change_space.setMaximumWidth(150)
+        self.axis_combo.setMaximumWidth(140)
+        self.window_spin.setMaximumWidth(78)
+        for spin in self.trace_spins:
+            spin.setMaximumWidth(65)
         self.history_view.set_compact(True)
         self.directions_view.set_compact(True)
-        self.set_history_controls(False)
         self.history_page.layout().setContentsMargins(0, 0, 0, 0)
         self.directions_page.layout().setContentsMargins(0, 0, 0, 0)
         self.directions_view.selected.connect(self.select_sequence)
         self.history_view.selected.connect(self.select_sequence)
-        self.availability_label = label()
-        root.insertWidget(1, self.availability_label)
+        self.availability_label = label(wrap=True)
+        header = QtWidgets.QWidget()
+        header_row = QtWidgets.QHBoxLayout(header)
+        header_row.setContentsMargins(0, 0, 0, 0)
+        header_row.addWidget(self.frame_label, 1)
+        self.availability_label.setMaximumWidth(245)
+        self.availability_label.setWordWrap(False)
+        header_row.addWidget(self.availability_label)
+        root.insertWidget(1, header)
+        self.empty_source = QtWidgets.QWidget()
+        empty_row = QtWidgets.QHBoxLayout(self.empty_source)
+        empty_row.addWidget(label('Sin fuente'))
+        for text, callback in (('Abrir captura', self.choose_capture), ('Demo sintetica', self.launch_demo), ('Ejemplo SDK', self.open_sdk_example)):
+            button = QtWidgets.QPushButton(text)
+            button.clicked.connect(callback)
+            empty_row.addWidget(button)
+        empty_row.addStretch()
+        root.insertWidget(1, self.empty_source)
         self.preview_memory()
+        for layout in self.findChildren(QtWidgets.QVBoxLayout):
+            layout.setSpacing(3)
+        for layout in self.findChildren(QtWidgets.QHBoxLayout):
+            layout.setSpacing(4)
+        self.visual_split.setSizes([260, 210])
+        self.history_view.setMinimumHeight(140)
+        self.directions_view.graph.setMinimumHeight(110)
+        self.history_notice.setFixedHeight(self.history_notice.fontMetrics().height()+6)
+        self.history_notice.setWordWrap(False)
+        self.history_notice.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.Fixed)
 
     def maximize_panel(self, index=None):
         self.maximized_panel = None if index == self.maximized_panel else index
@@ -468,13 +595,14 @@ class MonitorWindow(QtWidgets.QMainWindow):
         self.visual_split.widget(0).setVisible(self.maximized_panel != 2)
         self.history_view.set_compact(self.maximized_panel != 2)
         self.directions_view.set_compact(self.maximized_panel != 1)
-        self.set_history_controls(self.maximized_panel == 2)
         self.render()
 
     def set_history_controls(self, detailed):
-        controls = self.history_page.layout().itemAt(0).layout()
-        for i in (0, 3, 4, 5, 6):
-            controls.itemAt(i).widget().setVisible(detailed)
+        traces = self.evolution_combo.currentData() == 'traces'
+        self.traces_label.setVisible(traces)
+        for spin in self.trace_spins:
+            spin.setVisible(traces)
+        self.change_space.setVisible(self.evolution_combo.currentData() == 'change')
 
     def proposed_config(self):
         weights = tuple(float(x.strip()) for x in self.weights_edit.text().split(",") if x.strip())
@@ -507,7 +635,11 @@ class MonitorWindow(QtWidgets.QMainWindow):
 
     def select_sequence(self, sequence):
         try:
+            if self.replay is not None:
+                self.replay_play.setChecked(False)
             self.state.freeze_sequence(int(sequence))
+            if self.replay is not None:
+                self.replay_index = next(i for i, f in enumerate(self.state.navigation_samples(limit=None)) if f.sequence == int(sequence))
             self.freeze_action.setChecked(True)
             self.render()
         except ValueError as exc:
@@ -574,7 +706,7 @@ class MonitorWindow(QtWidgets.QMainWindow):
         if path:
             try:
                 save_state(path, self.state, limit=self.window_spin.value(),
-                           view={"mode": self.state.mode, "visual_limit": self.limit},
+                           view=self.view_settings(),
                            counters=self.channel.snapshot() if self.channel else {})
                 self.statusBar().showMessage("Captura parcial guardada (JSON + NPZ)", 6000)
             except (ValueError, OSError) as exc:
@@ -634,8 +766,12 @@ class MonitorWindow(QtWidgets.QMainWindow):
             self.axis_combo.setCurrentIndex(max(0, self.axis_combo.findData(view.get("axis", "sequence"))))
             for spin, value in zip(self.trace_spins, view.get("trace_indices", [0, 1, 2])):
                 spin.setValue(value)
+            self.evolution_combo.setCurrentIndex(max(0, self.evolution_combo.findData(view.get('evolution', 'change'))))
+            self.change_space.setCurrentIndex(max(0, self.change_space.findData(view.get('change_space', 'full'))))
+            self._restore_axes = view.get('map_axes', [0, 1])
             self.render()
-            self.replay_index = next((i for i, f in enumerate(self.navigation) if f.sequence == self.state.selection().sequence), 0)
+            selection = self.state.selection()
+            self.replay_index = next((i for i, f in enumerate(self.navigation) if selection and f.sequence == selection.sequence), 0)
             return True
         except (ValueError, OSError) as exc:
             self.show_error(str(exc))
@@ -663,7 +799,7 @@ class MonitorWindow(QtWidgets.QMainWindow):
             return
         self.replay_playing = playing
         icon = QtWidgets.QStyle.StandardPixmap.SP_MediaPause if playing else QtWidgets.QStyle.StandardPixmap.SP_MediaPlay
-        self.replay_play.setIcon(self.style().standardIcon(icon))
+        self.replay_play.setIcon(self.standard_icon(icon))
         if playing:
             if self.replay_index >= len(self.navigation)-1:
                 self.seek_replay(0)
@@ -726,7 +862,8 @@ class MonitorWindow(QtWidgets.QMainWindow):
                 self.show_error(str(exc))
 
     def export_basis(self):
-        basis = self.state.bases.get(self.state.selected_probe)
+        segment = self.state.segments.get(self.state.selected_segment)
+        basis = segment['basis'] if segment else None
         if basis is None:
             self.show_error("No hay una base aplicada")
             return
@@ -750,7 +887,10 @@ class MonitorWindow(QtWidgets.QMainWindow):
             self.show_error(str(exc))
             return
         self.pca_probe = self.state.selected_probe
+        self.pca_state = self.state
+        self.pca_descriptor = self.state.probes[self.pca_probe]
         self.pca_future = self.executor.submit(fit_pca, samples, self.pca_axes.value())
+        self.pca_dialog.hide()
         self.pca_button.setEnabled(False)
         self.pca_button.setText("Calculando PCA...")
 
@@ -758,13 +898,48 @@ class MonitorWindow(QtWidgets.QMainWindow):
         if self.pca_future is not None and self.pca_future.done():
             future, self.pca_future = self.pca_future, None
             self.pca_button.setEnabled(True)
-            self.pca_button.setText("Fijar PCA")
+            self.pca_button.setText("Crear nueva base PCA")
             try:
+                if self.state is not self.pca_state or self.state.probes.get(self.pca_probe) != self.pca_descriptor:
+                    raise ValueError('Resultado PCA descartado: el contexto de origen ya no es valido')
                 self.state.install_basis(future.result(), self.pca_probe)
             except (ValueError, KeyError, np.linalg.LinAlgError) as exc:
                 self.show_error(str(exc))
             finally:
-                self.state.work.release()
+                self.pca_state.work.release()
+                self.pca_state = None
+            self.render()
+
+    def prepare_pca(self):
+        self.render_directions()
+        self.pca_dialog.show()
+        self.pca_dialog.raise_()
+
+    def fit_scale(self):
+        values = self.state.values()
+        if values is not None:
+            self.scale_spin.setValue(max(1e-9, float(np.max(np.abs(values)))))
+
+    def trace_inspected(self):
+        self.trace_spins[0].setValue(self.inspected_index)
+        self.evolution_combo.setCurrentIndex(self.evolution_combo.findData('traces'))
+
+    def launch_demo(self):
+        started, _ = QtCore.QProcess.startDetached(sys.executable, ['-m', 'sonar_activaciones', 'demo'])
+        if not started:
+            self.show_error('No se pudo iniciar la demo sintetica')
+
+    def open_sdk_example(self):
+        from pathlib import Path
+        path = Path(__file__).resolve().parents[3] / 'examples' / 'manual.py'
+        if not path.exists() or not QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path))):
+            self.show_error('Ejemplo SDK: consultar examples/manual.py y docs/INTEGRATION.md en el repositorio')
+
+    def view_settings(self):
+        return {'mode': self.state.mode, 'visual_limit': self.limit, 'component': self.component_spin.value(),
+                'page': self.page_spin.value(), 'window': self.window_spin.value(), 'axis': self.axis_combo.currentData(),
+                'trace_indices': [s.value() for s in self.trace_spins], 'evolution': self.evolution_combo.currentData(),
+                'change_space': self.change_space.currentData(), 'map_axes': [max(0, s.currentIndex()) for s in self.map_axes]}
 
     def change_scale(self, value):
         self.limit = value
@@ -778,10 +953,17 @@ class MonitorWindow(QtWidgets.QMainWindow):
         self.render_inspector()
 
     def set_reference(self):
-        self.state.set_reference()
-        self.render()
+        try:
+            self.state.set_reference()
+            self.render()
+        except ValueError as exc:
+            self.show_error(str(exc))
 
     def toggle_freeze(self, checked):
+        if self.replay is not None:
+            self.replay_play.setChecked(not checked)
+            self.render()
+            return
         if checked:
             try:
                 self.state.freeze()
@@ -793,6 +975,10 @@ class MonitorWindow(QtWidgets.QMainWindow):
         self.render()
 
     def go_live(self):
+        if self.replay is not None:
+            self.replay_play.setChecked(False)
+            self.seek_replay(len(self.navigation)-1)
+            return
         self.state.live()
         self.freeze_action.setChecked(False)
         self.render()
@@ -803,12 +989,23 @@ class MonitorWindow(QtWidgets.QMainWindow):
     def ingest(self, sample):
         self.state.ingest(sample)
 
+    def set_render_rate(self, hz):
+        self.config = replace(self.config, render_hz=hz)
+        self.state.config = replace(self.state.config, render_hz=hz)
+        if hasattr(self, 'timer'):
+            self.timer.start(max(1, round(1000/hz)))
+
     def tick(self):
         self.poll_pca()
         if self.replay is not None:
             self.advance_replay()
+        signature = (self.state.revision, self.state.received_count, len(self.state.reprojection),
+                     self.source_closed, self.replay_index)
+        if signature == self._tick_signature and time.monotonic()-self._last_render_at < 1:
+            return
         start_ns = time.perf_counter_ns()
         self.render()
+        self._tick_signature = signature
         if self.channel and self.state.selection() is not None:
             self.channel.add("draw_ns_total", time.perf_counter_ns()-start_ns)
             self.channel.add("scene_updates")
@@ -820,6 +1017,9 @@ class MonitorWindow(QtWidgets.QMainWindow):
         if self.channel:
             if self.channel.stop.is_set():
                 self.close()
+                return
+            if self.channel.disconnected.is_set():
+                self.source_closed = True
                 return
             start = time.perf_counter()
             while count < self.config.max_receive_per_tick:
@@ -846,10 +1046,6 @@ class MonitorWindow(QtWidgets.QMainWindow):
                     self.channel.add("received_not_drawn")
                 self.pending_live = (key, current.captured_at)
             self.channel.add("received_not_drawn", count-int(candidate))
-        if self.channel:
-            counters = self.channel.snapshot()
-            self.counter_label.setText(f"Recibidas {counters['received']} | Descartadas {counters['transport_dropped']} | Gate {counters['gate_skipped']}")
-            self.counter_label.setToolTip(f"Recibidas no dibujadas: {counters['received_not_drawn']}; dibujadas: {counters['drawn']}")
 
     def on_painted(self, key, elapsed_ns):
         if self.channel:
@@ -863,13 +1059,19 @@ class MonitorWindow(QtWidgets.QMainWindow):
     def render(self, *_):
         if not hasattr(self, 'availability_label'):
             return
+        self._last_render_at = time.monotonic()
+        if self.channel:
+            counters = self.channel.snapshot()
+            self.counter_label.setText(f"Recibidas {counters['received']} | Descartadas {counters['transport_dropped']} | Gate {counters['gate_skipped']}")
+            self.counter_label.setToolTip(f"Recibidas no dibujadas: {counters['received_not_drawn']}; dibujadas: {counters['drawn']}")
         sample = self.state.current()
         selected = self.state.selection()
         key = None if selected is None else (selected.probe_id, selected.sequence)
         for view in (self.matrix, self.history_view, self.directions_view.graph):
             view.paint_key = key
         p = self.state.probes.get(self.state.selected_probe)
-        if p:
+        if p and p is not self._rendered_probe:
+            self.page_spin.dimension = p.dimension
             self.page_spin.setMaximum((p.dimension-1)//256)
             self.component_spin.setMaximum(p.dimension-1)
             for spin in self.trace_spins:
@@ -879,19 +1081,45 @@ class MonitorWindow(QtWidgets.QMainWindow):
             for spin in self.axis_spins:
                 spin.setMaximum(p.dimension-1)
             self.descriptor_label.setText(f"SONDA\n{p.name}\n\nFuente: {p.source_id}\nCaptura: {p.capture_point}\nDimension: {p.dimension}\nSeleccion: {p.selection_rule}\nEspacio: {p.space_id}")
-        else:
+        elif p is None:
             self.descriptor_label.setText("Sin sonda")
+        self._rendered_probe = p
         values = self.state.values()
         self.prepared_values = values
+        reason = unavailable_reason(selected, self.state.mode, self.state.references.get(self.state.selected_probe),
+                                    self.state.previous_frame(selected))
+        clipped = int(np.count_nonzero(np.abs(values) > self.limit)) if values is not None else 0
+        self.matrix_notice.setText(reason or (f'Fuera de escala de color: {clipped} componentes' if clipped else ''))
+        self.matrix_notice.setToolTip(self.matrix_notice.text())
+        self.trace_selected_button.setEnabled(sample is not None)
         if self.maximized_panel in (None, 0):
             self.matrix.set_values(values, self.page_spin.value(), self.limit)
+            self.matrix.context_text = f"Captura {selected.sequence if selected else '-'} | {MODE_NAMES[self.state.mode]}"
         self.ref_action.setEnabled(sample is not None)
+        self.ref_action.setToolTip('Fijar referencia completa' if sample is not None else 'Requiere un vector conservado; no basta una proyeccion')
         self.freeze_action.setEnabled(selected is not None)
-        state_name = ("REPLAY" if self.replay_playing else "PAUSA") if self.replay is not None else "CONGELADO" if self.state.frozen else "VIVO"
-        self.frame_label.setText("Sin muestras" if selected is None else f"{state_name}  seq {selected.sequence}")
+        self.auto_scale.setEnabled(values is not None)
+        state_name = ('Reproduccion' + (' en curso' if self.replay_playing else ' pausada')) if self.replay is not None else 'Desconectado' if self.source_closed else 'Vista pausada' if self.state.frozen else 'En vivo'
+        self.freeze_action.setText('Pausar reproduccion' if self.replay is not None else 'Pausar vista')
+        self.freeze_action.setChecked(not self.replay_playing if self.replay is not None else self.state.frozen is not None)
+        self.live_action.setText('Ir al final de la captura' if self.replay is not None else 'Volver al presente')
+        self.empty_source.setVisible(not self.state.probes)
+        context = dict(selected.context) if selected else {}
+        declared = ' | '.join(f'{k}: {context[k]}' for k in ('stream_id', 'token', 'token_id', 'layer', 'layer_index', 'processed_position') if k in context)
+        header = 'Sin captura' if selected is None else f'{state_name} | Captura {selected.sequence} | t={selected.captured_at:.3f} s | {declared}'
+        self.frame_label.setToolTip(header)
+        self.frame_label.setText(self.fontMetrics().elidedText(header, QtCore.Qt.TextElideMode.ElideRight, max(200, self.width()-285)))
+        if p:
+            badge = ('DEMO SINTETICA | ' if p.metadata.get('synthetic', False) else '') + p.source_id
+            self.source_badge.setText(self.fontMetrics().elidedText(badge, QtCore.Qt.TextElideMode.ElideRight, 280))
+            self.source_badge.setToolTip(f'Fuente: {p.source_id} | Sonda: {p.name}')
         availability = {'both': 'Vector y proyeccion', 'vector': 'Solo vector',
-                        'projection': 'Solo proyeccion: vector fuera del historial de detalle', 'absent': 'Captura ausente'}
+                        'projection': 'Solo proyeccion', 'absent': 'Captura ausente'}
         self.availability_label.setText(availability[selected.availability] if selected else 'Sin capturas')
+        ref = self.state.references.get(self.state.selected_probe)
+        if self.state.mode == 'reference_delta':
+            self.availability_label.setText(self.availability_label.text() + (f' | Ref. {ref.sequence}' if ref else ' | Sin referencia'))
+            self.availability_label.setToolTip(str(dict(ref.context)) if ref else 'Falta una referencia compatible')
         latest = self.state.last_sequences.get(self.state.selected_probe)
         rss = rss_bytes()
         self.memory_label.setText(f"Datos: {self.state.plan.committed/MIB:.2f}/{self.state.plan.total/MIB:.2f} MiB reservados\n"
@@ -924,6 +1152,9 @@ class MonitorWindow(QtWidgets.QMainWindow):
             first = self.state.navigation_samples(512)
             timing = f"t relativo {sample.captured_at-first[0].captured_at:.3f} s" if self.replay and first else f"Edad {max(0, time.monotonic()-sample.captured_at):.2f} s"
             self.status_label.setText(f"{timing} | Ref. {'-' if reference is None else reference.sequence}")
+        if selected is not None:
+            self.context_label.setText('CONTEXTO\n' + '\n'.join(f'{k}: {str(v)[:180]}' for k, v in selected.context.items()))
+            self.context_label.setToolTip(str(dict(selected.context)))
         self.render_inspector()
         self.render_history()
         if self.maximized_panel in (None, 1):
@@ -939,30 +1170,63 @@ class MonitorWindow(QtWidgets.QMainWindow):
             known = pca_known_peak(n, d, k, sum(len(f.payload)+header_cost(f.context) for f in frames))
             # Heuristic only: opaque library copies and dense SVD workspace may differ.
             external = (2*n*d + 4*min(n,d)**2)*8
-            self.pca_estimate.setText(f"PCA: {n} vectores x {d}; k={k}. Buffers conocidos ~{known/MIB:.2f} MiB. "
+            self.pca_estimate.setText(f"Sonda: {p.name}. PCA: {n} vectores compatibles x {d}; k={k}. Buffers conocidos ~{known/MIB:.2f} MiB; reserva {self.state.work.capacity/MIB:.2f} MiB. "
                                      f"Extra de biblioteca orientativo ~{external/MIB:.2f} MiB, no acotado por SONAR.")
         segments = [(sid, s) for sid, s in self.state.segments.items() if s['probe_id'] == self.state.selected_probe]
+        segment_ids = [None]+[sid for sid, _ in segments]
         self.segment_combo.blockSignals(True)
-        self.segment_combo.clear()
-        self.segment_combo.addItem('Sin segmento', None)
-        for sid, segment in segments:
-            self.segment_combo.addItem(f"{sid[:8]} | {segment['basis'].origin[:40]}", sid)
+        if [self.segment_combo.itemData(i) for i in range(self.segment_combo.count())] != segment_ids:
+            self.segment_combo.clear()
+            self.segment_combo.addItem('Sin segmento', None)
+            for sid, segment in segments:
+                self.segment_combo.addItem(f"{sid[:8]} | {segment['basis'].origin[:40]}", sid)
         self.segment_combo.setCurrentIndex(max(0, self.segment_combo.findData(self.state.selected_segment)))
         self.segment_combo.blockSignals(False)
         sid = self.state.selected_segment
         segment = self.state.segments.get(sid)
         basis = segment['basis'] if segment else None
-        self.basis_label.setText("Sin base: reserva proyectada pendiente" if basis is None else f"{len(basis.axis_names)} ejes fijos | {basis.origin}")
+        self.pca_button.setEnabled(bool(p) and self.pca_future is None)
+        self.import_basis_button.setEnabled(bool(p) and self.pca_future is None)
+        self.pca_start_button.setEnabled(bool(p) and self.pca_future is None)
+        if self.pca_future is None:
+            self.pca_button.setText('Crear nueva base PCA' if basis else 'Crear mapa PCA')
+        self.basis_label.setText(("Historia proyectada pendiente de base" if self.config.retention_mode == 'combined' else 'Sin base') if basis is None else f"{len(basis.axis_names)} ejes fijos | {basis.origin}")
         self.basis_label.setToolTip("" if basis is None else basis.basis_id)
+        self.basis_label.setVisible(self.maximized_panel == 1)
+        kind = 'PCA fija' if basis and basis.origin.startswith('PCA') else 'Componentes' if basis and 'componentes' in basis.origin.lower() else 'Base externa' if basis else 'Sin base'
+        self.panel_titles[1].setText(f'Mapa representacional | {kind}')
+        self.panel_titles[1].setToolTip(basis.origin if basis else 'Crear una base PCA o cargar una base externa')
+        names = basis.axis_names if basis else ()
+        for i, combo in enumerate(self.map_axes):
+            desired = combo.currentIndex() if combo.count() >= 2 else i
+            if hasattr(self, '_restore_axes'):
+                desired = self._restore_axes[i]
+            if [combo.itemText(j) for j in range(combo.count())] != list(names):
+                combo.blockSignals(True)
+                combo.clear()
+                for j, name in enumerate(names):
+                    combo.addItem(name, j)
+                combo.setCurrentIndex(min(max(0, desired), len(names)-1))
+                combo.blockSignals(False)
+            elif hasattr(self, '_restore_axes'):
+                combo.blockSignals(True)
+                combo.setCurrentIndex(min(max(0, desired), len(names)-1))
+                combo.blockSignals(False)
+            combo.setEnabled(len(names) >= 2)
+        if hasattr(self, '_restore_axes'):
+            del self._restore_axes
+        frames = self.state.viewport_frames(self.window_spin.value())
         try:
-            self.directions_view.set_processed(basis, sid, self.state.viewport_frames(self.window_spin.value()),
-                                              self.state.selection(), tuple(s.value() for s in self.map_axes),
-                                              self.state.references.get(self.state.selected_probe))
+            self.directions_view.set_processed(basis, sid, frames,
+                                              self.state.selection(), tuple(s.currentIndex() for s in self.map_axes),
+                                              self.state.references.get(self.state.selected_probe), self.state.mode,
+                                              self.state.previous_frame(frames[0]) if frames else None)
         except ValueError as exc:
             self.directions_view.metric_label.setText(str(exc))
 
     def render_history(self):
-        samples = self.state.visible_history(min(64, self.window_spin.value()))
+        samples = self.state.viewport_frames(self.window_spin.value())
+        self.set_history_controls(True)
         for i, axis in ((1, "time"), (2, "token")):
             try:
                 coordinates(samples, axis)
@@ -975,11 +1239,16 @@ class MonitorWindow(QtWidgets.QMainWindow):
                 self.axis_combo.setCurrentIndex(0)
                 self.axis_combo.blockSignals(False)
         if self.maximized_panel in (None, 2):
+            segment = self.state.segments.get(self.state.selected_segment)
             self.history_view.set_data(samples, self.state.mode,
                                       self.state.references.get(self.state.selected_probe),
                                       self.component_spin.value(), list(dict.fromkeys(s.value() for s in self.trace_spins)),
-                                      self.limit, self.axis_combo.currentData())
-            self.history_view.set_frames(self.state.viewport_frames(self.window_spin.value()), self.state.selection())
+                                      self.limit, self.axis_combo.currentData(), kind=self.evolution_combo.currentData(),
+                                      space=self.change_space.currentData(), basis=segment['basis'] if segment else None,
+                                      previous=self.state.previous_frame(samples[0]) if samples else None,
+                                      selected=self.state.selection())
+            self.history_notice.setText(self.history_view.notice.strip(' |'))
+            self.history_notice.setToolTip(self.history_notice.text())
         self.navigation = self.state.navigation_samples(limit=None)
         self.history_slider.blockSignals(True)
         self.history_slider.setRange(0, max(0, len(self.navigation)-1))
@@ -991,17 +1260,37 @@ class MonitorWindow(QtWidgets.QMainWindow):
 
     def render_inspector(self):
         sample, values = self.state.current(), getattr(self, 'prepared_values', None)
+        frame = self.state.selection()
         i = self.inspected_index
-        if sample is None or i >= sample.descriptor.dimension:
+        if frame is None:
             self.inspector.setText("Sin lectura")
             return
         shown = "No disponible" if values is None else f"{values[i]:.9g}"
-        self.inspector.setText(f"Indice: {i}\nOriginal: {sample.values[i]:.9g}\nVista: {shown}")
+        original = f'{sample.values[i]:.9g}' if sample and i < sample.descriptor.dimension else 'Vector no conservado'
+        info = f'Sesion: {self.state.history.session_id}\nCaptura: {frame.probe_id}/{frame.sequence}\nIndice: {i}\nOriginal: {original}\nVista: {shown}'
+        segment = self.state.segments.get(self.state.selected_segment)
+        ref = self.state.references.get(frame.probe_id)
+        if self.inspector_dock.isVisible() and segment:
+            basis = segment['basis']
+            info += f'\nBase: {basis.basis_id}\nProcedencia declarada: {basis.origin}\nNombres de ejes externos, no interpretaciones certificadas.'
+            try:
+                z = projected_values(frame, basis)
+                if ref is not None and frame.descriptor.compatible(ref.descriptor) and z is not None:
+                    info += f'\nDistancia proyectada a referencia: {np.linalg.norm(z-basis.project(ref.values)):.6g}'
+                    if sample is not None:
+                        metrics = basis.displacement(sample.values.astype(float)-ref.values)
+                        info += f'\nDistancia completa: {metrics["original_norm"]:.6g}\nNorma omitida ({metrics["metric"]}): {metrics["omitted_norm"]}'
+                    else:
+                        info += '\nDistancia completa: no disponible'
+            except ValueError as exc:
+                info += f'\n{exc}'
+        self.inspector.setText(info)
 
     def closeEvent(self, event):
         self.timer.stop()
         self.receive_timer.stop()
         self.executor.shutdown(wait=False, cancel_futures=True)
+        self.pca_dialog.close()
         if self.channel:
             if self.pending_live is not None:
                 self.channel.add("received_not_drawn")

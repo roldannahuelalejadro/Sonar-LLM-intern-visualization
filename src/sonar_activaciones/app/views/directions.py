@@ -1,27 +1,45 @@
 import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtWidgets, QtCore
-from ...processing.reference import consecutive, difference, values_for
-from .timing import TimedGraphicsLayout
+from ...processing.reference import consecutive
+from ...processing.display import projected_series, MODE_NAMES
+from .timing import TimedGraphicsLayout, stable_range, NoticeLabel
 
 
 class DirectionsView(QtWidgets.QWidget):
     selected = QtCore.Signal(object)
+
     def __init__(self):
         super().__init__()
         layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
         self.graph = TimedGraphicsLayout()
+        self.graph.ci.layout.setContentsMargins(2, 2, 2, 2)
+        self.graph.ci.layout.setSpacing(2)
         layout.addWidget(self.graph, 1)
         self.scores = self.graph.addPlot(row=0, col=0)
-        self.scores.setLabel("left", "Score")
-        self.scores.getAxis("left").enableAutoSIPrefix(False)
+        self.scores.setLabel('left', 'Coordenada')
         self.plane = self.graph.addPlot(row=0, col=1)
         self.plane.showGrid(x=True, y=True, alpha=.15)
-        self.plane.setAspectLocked(True)
-        self.metric_label = QtWidgets.QLabel("Sin base")
-        self.metric_label.setWordWrap(True)
+        self.plane.getAxis('left').setWidth(70)
+        self.plane.getAxis('bottom').setHeight(44)
+        self.plane.getAxis('left').enableAutoSIPrefix(False)
+        self.plane.getAxis('bottom').enableAutoSIPrefix(False)
+        self.path = self.plane.plot(connect='finite', pen=pg.mkPen('#77a09c', width=1))
+        self.scatter = pg.ScatterPlotItem(size=6, pen=None)
+        self.scatter.sigClicked.connect(lambda item, pts: self.selected.emit(int(pts[0].data())))
+        self.plane.addItem(self.scatter)
+        self.marker = pg.ScatterPlotItem(size=11, pen=None, brush='#b64759')
+        self.plane.addItem(self.marker)
+        self.bars = pg.BarGraphItem(x=np.array([]), height=np.array([]), width=.65)
+        self.scores.addItem(self.bars)
+        self._labels = None
+        self.metric_label = NoticeLabel()
+        self.metric_label.setText('Sin base')
+        self.setMinimumHeight(140)
         layout.addWidget(self.metric_label)
         self.projected = None
+        self.metric_label.show()
         self.compact = False
 
     def set_compact(self, compact):
@@ -36,111 +54,78 @@ class DirectionsView(QtWidgets.QWidget):
             self.graph.ci.addItem(self.plane, row=0, col=1)
         self.compact = compact
 
-    def set_processed(self, basis, segment_id, frames, selected, axes=(0, 1), reference=None):
-        self.scores.clear()
-        self.plane.clear()
+    def set_processed(self, basis, segment_id, frames, selected, axes=(0, 1), reference=None,
+                      mode='raw', previous=None):
         self.projected = None
         if basis is None:
-            self.metric_label.setText("Pendiente de proyeccion: sin base fija")
+            self._clear()
+            self.graph.hide()
+            self.metric_label.setText('Todavia no hay un mapa. Crear una base PCA o cargar una base externa.')
             return
-        xaxis, yaxis = (min(a, len(basis.axis_names)-1) for a in axes)
+        self.graph.show()
+        if len(basis.axis_names) < 2:
+            self._clear()
+            self.graph.hide()
+            self.metric_label.setText('Base de un eje: seleccionar o crear una base con al menos dos ejes para el plano.')
+            return
+        xaxis, yaxis = axes
+        if xaxis == yaxis or not all(0 <= a < len(basis.axis_names) for a in axes):
+            self._clear()
+            self.metric_label.setText('Seleccionar dos ejes distintos y validos.')
+            return
+        values = projected_series(frames, basis, mode, reference, previous)
         points, spots = [], []
-        previous = None
-        for frame in frames:
-            payload = frame.projections.get(segment_id)
-            if payload is None:
-                previous = None
-                points.append((np.nan, np.nan))
-                continue
-            z = np.frombuffer(payload, '<f4')
-            if previous is not None and (frame.sequence != previous.sequence+1 or frame.context.get('stream_id') != previous.context.get('stream_id')):
+        prior = previous
+        for f, z in zip(frames, values):
+            if prior is not None and not consecutive(prior, f):
                 points.append((np.nan, np.nan))
             points.append((z[xaxis], z[yaxis]))
-            spots.append({"pos": (z[xaxis], z[yaxis]), "data": frame.sequence,
-                          "symbol": "o" if frame.payload is not None else "t", "brush": '#267d86'})
-            previous = frame
-        if points:
+            if np.isfinite(z).all():
+                spots.append({'pos': (z[xaxis], z[yaxis]), 'data': f.sequence,
+                              'symbol': 't' if f.payload is None else 'o', 'brush': '#267d86'})
+            prior = f
+        if points and mode != 'previous_delta':
             xy = np.asarray(points)
-            self.plane.plot(xy[:, 0], xy[:, 1], connect='finite', pen=pg.mkPen('#669d95', width=1))
-        scatter = pg.ScatterPlotItem(spots, size=6, pen=None)
-        scatter.sigClicked.connect(lambda item, pts: self.selected.emit(int(pts[0].data())))
-        self.plane.addItem(scatter)
-        self.plane.setLabel('bottom', basis.axis_names[xaxis])
-        self.plane.setLabel('left', basis.axis_names[yaxis])
-        payload = selected.projections.get(segment_id) if selected else None
-        if payload is None:
-            self.metric_label.setText("Captura seleccionada sin coordenadas en este segmento")
+            self.path.setData(xy[:, 0], xy[:, 1])
+        else:
+            self.path.setData([], [])
+        self.scatter.setData(spots)
+        self.marker.setData([])
+        prefix = '' if mode == 'raw' else 'Delta '
+        title = 'Posiciones' if mode == 'raw' else 'Desplazamiento a referencia' if mode == 'reference_delta' else 'Desplazamiento por captura'
+        labels = (basis.basis_id, axes, mode)
+        if self._labels != labels:
+            self.plane.setLabel('bottom', prefix+basis.axis_names[xaxis])
+            self.plane.setLabel('left', prefix+basis.axis_names[yaxis])
+            self.plane.setTitle(title, size='10pt')
+            self.scores.getAxis('bottom').setTicks([list(enumerate(basis.axis_names))])
+            self._labels = labels
+        valid = values[np.isfinite(values).all(axis=1)]
+        constant = len(valid) > 0 and np.all(np.ptp(valid[:, [xaxis, yaxis]], axis=0) == 0)
+        if len(valid):
+            for axis, col in (('x', xaxis), ('y', yaxis)):
+                stable_range(self.plane, axis, valid[:, col], labels)
+        index = next((i for i, f in enumerate(frames) if selected and f.sequence == selected.sequence), None)
+        if index is None or not np.isfinite(values[index]).all():
+            self.bars.setOpts(x=np.array([]), height=np.array([]), brushes=[])
+            self.metric_label.setText('Seleccion sin coordenadas calculables en este modo/base; revisar referencia o captura consecutiva.')
             return
-        scores = np.frombuffer(payload, '<f4')
+        scores = values[index]
         self.projected = scores
-        self.scores.addItem(pg.BarGraphItem(x=np.arange(len(scores)), height=scores, width=.65,
-                                            brushes=['#287d9b' if z >= 0 else '#b64759' for z in scores]))
-        self.scores.getAxis('bottom').setTicks([list(enumerate(basis.axis_names))])
-        self.plane.plot([scores[xaxis]], [scores[yaxis]], pen=None, symbol='o', symbolSize=11, symbolBrush='#b64759')
-        metric = "Coordenadas del vector original" + (" | derivado" if segment_id in selected.derived else "")
-        if reference is not None:
-            projected_distance = np.linalg.norm(scores-basis.project(reference.values))
-            metric += f" | Dist. proyectada a ref.: {projected_distance:.4g}"
-            if selected.payload is not None:
-                full = np.linalg.norm(selected.observation().values.astype(float)-reference.values)
-                metric += f" | Dist. completa: {full:.4g}"
-            else:
-                metric += " | Dist. completa no disponible"
-        self.metric_label.setText(metric)
+        if not self.compact:
+            self.bars.setOpts(x=np.arange(len(scores)), height=scores,
+                              brushes=['#287d9b' if z >= 0 else '#b64759' for z in scores])
+        self.marker.setData(x=[scores[xaxis]], y=[scores[yaxis]])
+        metric = MODE_NAMES[mode]
+        if segment_id not in selected.projections:
+            metric += ' | Proyeccion al vuelo del vector conservado'
+        if constant:
+            metric += ' | Proyeccion constante en esta ventana; no implica ausencia de cambios fuera del plano'
+        self.metric_label.setText(metric if metric != MODE_NAMES[mode] else '')
+        self.metric_label.setToolTip(metric)
 
-    def set_data(self, basis, samples, mode, reference, start_sequence):
-        self.scores.clear()
-        self.plane.clear()
-        self.projected = None
-        if basis is None or not samples:
-            self.metric_label.setText("Sin base" if basis is None else "Sin lecturas")
-            return
-        current = samples[-1]
-        previous = samples[-2] if len(samples) > 1 else None
-        values = values_for(current, mode, reference, previous)
-        if values is None:
-            self.metric_label.setText("Delta no disponible")
-            return
-        transform = basis.project if mode == "raw" else basis.project_delta
-        scores = transform(values)
-        self.projected = scores
-        self.scores.addItem(pg.BarGraphItem(x=np.arange(len(scores)), height=scores, width=.65,
-                                           brushes=["#287d9b" if s >= 0 else "#b64759" for s in scores]))
-        self.scores.getAxis("bottom").setTicks([list(enumerate(basis.axis_names))])
-        for i, value in enumerate(scores):
-            text = pg.TextItem(f"{value:.4g}", color="#26343c", anchor=(.5, 1 if value >= 0 else 0))
-            text.setPos(i, value)
-            self.scores.addItem(text)
-        low, high = min(0, float(np.min(scores))), max(0, float(np.max(scores)))
-        margin = max(.05, (high-low)*.22)
-        self.scores.setYRange(low-margin, high+margin, padding=0)
-        points = []
-        for i, sample in enumerate(samples):
-            if sample.sequence < start_sequence:
-                continue
-            prior = samples[i-1] if i else None
-            if prior is not None and not consecutive(prior, sample):
-                points.append([np.nan, np.nan])
-            v = values_for(sample, mode, reference, prior)
-            if v is None:
-                points.append([np.nan, np.nan])
-                continue
-            z = transform(v)
-            points.append([z[0], z[1] if len(z) > 1 else 0])
-        if points:
-            points = np.array(points)
-            self.plane.plot(points[:, 0], points[:, 1], connect="finite", pen=pg.mkPen("#61968e", width=1.5),
-                            symbol="o", symbolSize=3, symbolBrush="#61968e")
-        self.plane.plot([scores[0]], [scores[1] if len(scores)>1 else 0], pen=None, symbol="o",
-                        symbolSize=10, symbolBrush="#b64759")
-        self.plane.setLabel("bottom", basis.axis_names[0])
-        self.plane.setLabel("left", basis.axis_names[1] if len(scores)>1 else "Sin segundo eje")
-        anchor = reference if reference is not None else previous if consecutive(previous, current) else None
-        if anchor is None:
-            self.metric_label.setText("Desplazamiento: sin referencia ni predecesora consecutiva")
-            return
-        metrics = basis.displacement(difference(current, anchor))
-        omitted = "no disponible (direcciones no ortonormales)" if metrics["omitted_norm"] is None else f"{metrics['omitted_norm']:.6g}"
-        self.metric_label.setText(f"Ancla seq {anchor.sequence} | Norma completa original: {metrics['original_norm']:.6g}\n"
-                            f"Norma omitida [{metrics['metric']}]: {omitted}"
-                            + (f" | Norma transformada: {metrics['transformed_norm']:.6g}" if metrics["metric"] != "original" else ""))
+    def _clear(self):
+        self.path.setData([], [])
+        self.scatter.setData([])
+        self.marker.setData([])
+        self.bars.setOpts(x=np.array([]), height=np.array([]), brushes=[])

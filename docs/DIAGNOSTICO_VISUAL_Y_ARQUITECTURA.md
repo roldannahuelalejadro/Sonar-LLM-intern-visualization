@@ -1,5 +1,8 @@
 # SONAR 0.2: diagnostico visual y arquitectura actual
 
+Documento historico: describe el problema previo a la correccion. Consultar
+[UPDATE_0_2_1.md](UPDATE_0_2_1.md) para los cambios y la arquitectura actual.
+
 Fecha: 2026-10-09.
 
 Alcance: revision de las tres capturas de la demo y del codigo actual. Este

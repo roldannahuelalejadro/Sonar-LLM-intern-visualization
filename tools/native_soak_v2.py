@@ -7,6 +7,7 @@ import tempfile
 import time
 from dataclasses import replace
 import numpy as np
+from evidence import identity
 from sonar_activaciones import MonitorConfig, ProbeDescriptor
 from sonar_activaciones.session import MonitorSession
 
@@ -24,6 +25,7 @@ def viewer(probes, config, channel):
     for p in probes:
         window.state.install_basis(component_basis(p, [0, 1]), p.probe_id)
     window.show()
+    revision = identity()
     start = time.monotonic()
     checkpoints, errors = [], []
     temporary = tempfile.TemporaryDirectory(prefix='sonar-v02-soak-')
@@ -31,6 +33,9 @@ def viewer(probes, config, channel):
         elapsed = time.monotonic()-start
         state = window.state
         try:
+            window.probe_combo.setCurrentIndex(len(checkpoints) % len(probes))
+            window.mode_combo.setCurrentIndex(len(checkpoints) % 3)
+            window.evolution_combo.setCurrentIndex(len(checkpoints) % 3)
             state.live()
             state.set_reference()
             state.freeze()
@@ -63,10 +68,14 @@ def viewer(probes, config, channel):
         for name in ('projection_retired', 'capture_retired', 'vector_retired_projection_kept'):
             if window.state.history.counters[name] < 1000:
                 errors.append(f'Insufficient wraps: {name}')
-        report = {"scope": "native Qt + real manual SDK + three probes + mixed I/O",
+        report = {"scope": "native Qt + real manual SDK + three probes + mixed I/O + visual modes",
+                  'revision': revision, 'final_revision': identity(),
                   "duration": time.monotonic()-start, "platform": platform.platform(),
                   "checkpoints": checkpoints, "errors": errors, "completed": not errors}
-        Path('artifacts/native-soak-v02.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
+        if report['final_revision']['application_sha256'] != revision['application_sha256']:
+            errors.append('Application changed during verification')
+            report['completed'] = False
+        Path('artifacts/native-soak-v021.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
         window.close()
     pulse = QtCore.QTimer()
     pulse.timeout.connect(checkpoint)
@@ -88,16 +97,23 @@ def main():
     values = [np.sin(np.arange(p.dimension, dtype=np.float32)*.01) for p in probes]
     start = time.monotonic()
     seq = 0
+    child_exitcode = None
     try:
         while session.status()['state'] == 'connected' and time.monotonic()-start < 640:
             for p, a in zip(probes, values):
                 session.publish(p.probe_id, a+np.sin(seq*.02), {'stream_id': 'A' if seq%1000 < 500 else 'B'})
             seq += 1
             time.sleep(.004)
+        session._process.join(3)
+        child_exitcode = session._process.exitcode
     finally:
         session.close()
     assert {p.pid for p in mp.active_children()} == children
-    report = json.loads(Path('artifacts/native-soak-v02.json').read_text())
+    report = json.loads(Path('artifacts/native-soak-v021.json').read_text())
+    report['viewer_exitcode'] = child_exitcode
+    report['orphan_processes'] = len({p.pid for p in mp.active_children()}-children)
+    report['completed'] = report['completed'] and child_exitcode == 0
+    Path('artifacts/native-soak-v021.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
     assert report['completed'], report['errors']
     print('NATIVE SOAK COMPLETE, no orphan children', flush=True)
 

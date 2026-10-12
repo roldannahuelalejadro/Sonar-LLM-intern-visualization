@@ -11,11 +11,6 @@ from sonar_activaciones.app.window import MonitorWindow
 from .test_core import probe, sample
 
 
-@pytest.fixture(scope="session")
-def app():
-    return _application()
-
-
 def test_matrix_orientation_padding_reference_and_freeze(app):
     p = probe(dimension=19)
     w = MonitorWindow([p], MonitorConfig())

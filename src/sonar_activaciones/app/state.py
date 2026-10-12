@@ -3,7 +3,7 @@ from dataclasses import replace
 import time
 from ..processing.combined import CombinedHistory
 from ..processing.memory import plan_memory, WorkAdmission, pca_known_peak, header_cost
-from ..processing.reference import values_for
+from ..processing.display import vector_values
 
 
 class ViewerState:
@@ -76,12 +76,16 @@ class ViewerState:
         return selected.observation() if selected else None
 
     def previous(self):
-        samples = self.visible_history(2)
-        return samples[-2] if len(samples) > 1 else None
+        frame = self.previous_frame(self.selection())
+        return frame.observation() if frame else None
+
+    def previous_frame(self, frame):
+        ring = self.history.rings.get(frame.probe_id) if frame else None
+        return ring.frames.get(frame.sequence-1) if ring else None
 
     def values(self):
-        current = self.current()
-        return None if current is None else values_for(current, self.mode, self.references.get(self.selected_probe), self.previous())
+        frame = self.selection()
+        return vector_values(frame, self.mode, self.references.get(self.selected_probe), self.previous_frame(frame))
 
     def set_reference(self):
         current = self.current()
@@ -215,7 +219,7 @@ class ViewerState:
     def freeze(self, index=None, limit=128):
         frames = self.navigation_samples()
         if frames:
-            self.frozen = frames[index if index is not None else -1].pin()
+            self.freeze_sequence(frames[index if index is not None else -1].sequence)
 
     def freeze_sequence(self, sequence, limit=128):
         ring = self.history.rings.get(self.selected_probe)
@@ -227,6 +231,10 @@ class ViewerState:
         self.frozen = frame.pin()
         if self.selected_segment not in frame.projections and frame.projections:
             self.selected_segment = next(reversed(frame.projections))
+        elif not frame.projections:
+            matching = [sid for sid, s in self.segments.items()
+                        if s['probe_id'] == self.selected_probe and s['start'] <= frame.sequence]
+            self.selected_segment = matching[-1] if matching else self.active_segments.get(self.selected_probe)
 
     def live(self):
         self.frozen = None

@@ -16,6 +16,29 @@ def _record(frame):
     return {"sequence": frame.sequence, "captured_at": frame.captured_at, "context": dict(frame.context)}
 
 
+def validate_view(view, state):
+    if not isinstance(view, dict) or len(json_bytes(view)) > 4096:
+        raise ValueError('Estado visual invalido o fuera de limite')
+    if view.get('mode', 'raw') not in ('raw', 'reference_delta', 'previous_delta'):
+        raise ValueError('Modo de captura invalido')
+    if view.get('axis', 'sequence') not in ('sequence', 'time', 'token'):
+        raise ValueError('Eje de captura invalido')
+    if view.get('evolution', 'change') not in ('change', 'traces', 'heat') or view.get('change_space', 'full') not in ('full', 'projected'):
+        raise ValueError('Modo de historial invalido')
+    d = state.probes[state.selected_probe].dimension
+    for key, lo, hi in (('component', 0, d-1), ('page', 0, (d-1)//256), ('window', 4, 512)):
+        if key in view and (type(view[key]) is not int or not lo <= view[key] <= hi):
+            raise ValueError(f'Estado visual invalido: {key}')
+    for key, lo, hi, length in (('trace_indices', 0, d-1, None), ('map_axes', 0, 31, 2)):
+        if key in view:
+            items = view[key]
+            if not isinstance(items, list) or not 1 <= len(items) <= 3 or (length and len(items) != length) or any(type(i) is not int or not lo <= i <= hi for i in items):
+                raise ValueError(f'Selectores invalidos: {key}')
+    limit = view.get('visual_limit', 1.)
+    if not isinstance(limit, (int, float)) or not math.isfinite(limit) or not 1e-9 <= limit <= 1e30:
+        raise ValueError('Escala visual invalida')
+
+
 def save_state(path, state, *, limit=128, view=None, counters=None):
     if not 1 <= limit <= 512:
         raise ValueError("Ventana de exportacion: 1..512 capturas por sonda")
@@ -121,6 +144,7 @@ def load_state(path, config, admission, *, choose_reference=None):
             snapshot = old.snapshot or old.samples[-1]
             state.selected_probe = snapshot.probe_id
             state.freeze_sequence(snapshot.sequence)
+            validate_view(old.view, state)
             return state, old.view, old.counters
         if document.get("schema_version") != 2:
             raise ValueError("Version de captura no admitida")
@@ -238,8 +262,7 @@ def load_state(path, config, admission, *, choose_reference=None):
         if sid is not None and (sid not in state.segments or state.segments[sid]["probe_id"] != state.selected_probe):
             raise ValueError("Segmento seleccionado incompatible")
         state.selected_segment = sid
-        if len(json_bytes(document["view"])) > 4096:
-            raise ValueError("Estado visual fuera de limite")
+        validate_view(document['view'], state)
         return state, document["view"], document["counters"]
     except (KeyError, TypeError, IndexError, AttributeError) as exc:
         raise ValueError(f"Captura mixta invalida: {exc}") from exc

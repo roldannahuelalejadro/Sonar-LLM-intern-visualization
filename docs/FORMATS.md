@@ -106,3 +106,22 @@ fragmentos de 64 KiB; compresion opaca de biblioteca se distingue de buffers
 conocidos. Como en v1, el guardado es JSON + NPZ local con SHA-256, sin pickle.
 Carga/guardado son sincronicos: pueden retrasar recepcion, pero no bloquean al
 productor para vaciar su cola. Los descartes se contabilizan.
+
+## Estado visual opcional (0.2.1)
+
+No cambia `schema_version`. `view` admite `mode`, `visual_limit`, `component`,
+`page`, `window`, `axis`, `trace_indices`, `evolution`, `change_space` y
+`map_axes`. Los lectores antiguos ignoran los campos adicionales; el lector
+actual conserva la lectura v1/v2 y valida tipos, valores finitos e indices antes
+de adoptar la sesion. `view` no puede superar 4096 bytes serializados.
+
+`evolution` puede ser `change`, `traces` o `heat`; `change_space`, `full` o
+`projected`. `map_axes` contiene dos indices entre 0 y 31, posteriormente
+ajustados a los ejes realmente disponibles. Ventana: 4..512 en la interfaz.
+Al faltar campos nuevos, se usa cambio consecutivo completo y ejes iniciales.
+
+Guardar con un modo de diferencia no reemplaza los vectores por deltas. No se
+guardan todos los detalles de disposicion: panel maximizado, tamanos de splitters,
+visibilidad del inspector, ventana/k del proximo ajuste PCA y velocidad de
+reproduccion no se restauran. La matriz/base/seleccion de datos y los modos
+anteriores no equivalen a una restauracion completa del escritorio.

@@ -2,7 +2,7 @@
 
 from .contracts import MonitorConfig, Observation, ProbeDescriptor
 
-__version__ = "0.2.0"
+__version__ = "0.2.2"
 __all__ = ["MonitorConfig", "Observation", "ProbeDescriptor", "open_monitor"]
 
 

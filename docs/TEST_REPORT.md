@@ -1,5 +1,8 @@
 # Verificacion local de SONAR 0.2
 
+Informe historico. La verificacion de la version actual esta en
+[TEST_REPORT_0_2_1.md](TEST_REPORT_0_2_1.md); no trasladar estas cifras a 0.2.1.
+
 Fecha: 2026-10-09. Solo fuentes sinteticas. No se descargo ni ejecuto una LLM.
 Informe anterior preservado en `TEST_REPORT_V01.md`.
 

@@ -1,5 +1,31 @@
 # Registro de construccion
 
+## Correccion de fluidez 0.2.2, 2026-10-12
+
+Video de uso y reproduccion nativa confirmaron cambios de geometria por avisos
+y movimiento escalonado a 5 Hz. Se conservan objetos graficos entre cuadros,
+rangos con encuadre estable y filas de avisos; se solicita 30 Hz por defecto
+con control visible. Recepcion y captura siguen independientes. Se evita
+reconstruir el mismo cuadro sin datos nuevos, salvo actualizacion lenta de estado.
+Regresiones de movimiento, objetos, huecos y geometria: 91 pruebas aprobadas.
+Evidencia actual y alcance en `FLUIDEZ_0_2_2.md`.
+
+## Actualizacion 0.2.1, 2026-10-10
+
+Seleccion comun y calculos visuales unificados en `processing/display.py`.
+Historial de evolucion en vista conjunta, intervalo temporal completo,
+PCA visible con contexto de origen protegido, modos afines coherentes y
+controles de matriz/ejes mas explicitos. Interfaz nativa Qt, sin dependencias
+nuevas, sin modelos y sin cambios al contrato del transporte.
+
+Persistencia visual opcional compatible con capturas anteriores. Regresiones
+numericas, GUI, archivos y teardown: 84 pruebas con salida limpia. Evidencia
+visual nativa en dos tamanos y comparacion de rendimiento con la misma carga.
+Ensayo integrado de 610 s aprobado con salida 0, sin huerfanos y sin cambio de
+huella de aplicacion; 222760 capturas recibidas, 36.60% de descartes bajo la carga
+de estres. Sus limites se documentan en `TEST_REPORT_0_2_1.md`.
+La nueva evidencia incluye hash del codigo cargado, no solo el commit anterior.
+
 ## Actualizacion 0.2, 2026-10-09
 
 U0: baseline repetido, 43 pruebas aprobadas; copia de mediciones v0.1 preservada.

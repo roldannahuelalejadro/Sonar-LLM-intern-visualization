@@ -128,8 +128,8 @@ def component_basis(probe, indices):
         raise ValueError("Base por componentes supera el limite")
     w = np.zeros((probe.dimension, len(indices)))
     w[indices, np.arange(len(indices))] = 1
-    return DirectionBasis(uuid.uuid4().hex, probe.space_id, tuple(f"c{i}" for i in indices),
-                          "componentes elegidas por el usuario", w, np.zeros(probe.dimension), np.ones(probe.dimension))
+    return DirectionBasis(uuid.uuid4().hex, probe.space_id, tuple(f"Componente {i}" for i in indices),
+                          "Vista directa de componentes", w, np.zeros(probe.dimension), np.ones(probe.dimension))
 
 
 def fit_pca(samples, n_axes=2):

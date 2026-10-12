@@ -182,7 +182,7 @@ class Observation:
 
 @dataclass(frozen=True, slots=True)
 class MonitorConfig:
-    render_hz: float = 5.0
+    render_hz: float = 30.0
     queue_capacity: int = 16
     max_sample_bytes: int = MIB
     history_bytes: int | None = None
